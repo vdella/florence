@@ -39,3 +39,12 @@ def load_document(path: str) -> str:
         return load_txt(file_path)
 
     raise ValueError(f"Formato não suportado: {suffix}")
+
+
+if __name__ == "__main__":
+    resources = "/home/della/Vault/florence/resources/"
+    tcc = Path(resources + "tcc.pdf")
+    workplan = Path(resources + "workplan.pdf")
+
+    print(load_pdf(tcc))
+    print(load_pdf(workplan))
