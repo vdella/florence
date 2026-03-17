@@ -1,37 +1,50 @@
-import chromadb
+from sentence_transformers import util
 
-from app.core.config import settings
-from app.ingestion.embedder import embed_texts
-
-
-client = chromadb.PersistentClient(path=settings.chroma_dir)
-collection = client.get_or_create_collection(name="patient_safety_docs")
+from app.ingestion.embedder import embed_query, embed_texts
+from app.schemas.retrieval import SearchResponse, SearchResultItem
 
 
-def search_similar_chunks(query: str, top_k: int = 5) -> list[dict]:
-    """
-    Realiza busca semântica no banco vetorial e retorna os chunks mais relevantes.
-    """
-    query_embedding = embed_texts([query])[0]
+def retrieve(query: str, chunks: list[str], top_k: int = 5) -> SearchResponse:
+    if not chunks:
+        return SearchResponse(query=query, results=[])
 
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=top_k,
-        include=["documents", "metadatas", "distances"],
+    chunk_embeddings = embed_texts(chunks)
+    return retrieve_from_embeddings(
+        query=query,
+        chunks=chunks,
+        chunk_embeddings=chunk_embeddings,
+        top_k=top_k,
     )
 
-    documents = results.get("documents", [[]])[0]
-    metadatas = results.get("metadatas", [[]])[0]
-    distances = results.get("distances", [[]])[0]
 
-    response = []
-    for doc, metadata, distance in zip(documents, metadatas, distances):
-        response.append(
-            {
-                "document": doc,
-                "metadata": metadata or {},
-                "distance": float(distance) if distance is not None else None,
-            }
+def retrieve_from_embeddings(
+        query: str,
+        chunks: list[str],
+        chunk_embeddings,
+        top_k: int = 5,
+) -> SearchResponse:
+    if not chunks:
+        return SearchResponse(query=query, results=[])
+
+    query_embedding = embed_query(query)
+    scores = util.cos_sim(query_embedding, chunk_embeddings)[0]
+
+    k = min(top_k, len(chunks))
+    top_indices = scores.argsort(descending=True)[:k].tolist()
+
+    results: list[SearchResultItem] = []
+    for idx in top_indices:
+        score = float(scores[idx])
+
+        results.append(
+            SearchResultItem(
+                document=chunks[idx],
+                metadata={
+                    "chunk_id": idx,
+                    "score": score,
+                },
+                distance=1.0 - score,
+            )
         )
 
-    return response
+    return SearchResponse(query=query, results=results)

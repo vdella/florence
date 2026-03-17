@@ -1,12 +1,12 @@
 from pathlib import Path
-from pypdf import PdfReader
+
 from docx import Document as DocxDocument
+from pypdf import PdfReader
 
 
 def load_pdf(path: Path) -> str:
     reader = PdfReader(path)
-
-    text_parts = []
+    text_parts: list[str] = []
 
     for page in reader.pages:
         text = page.extract_text()
@@ -27,24 +27,17 @@ def load_txt(path: Path) -> str:
 
 def load_document(path: str) -> str:
     file_path = Path(path)
+
+    if not file_path.exists():
+        raise FileNotFoundError(f"Arquivo não encontrado: {file_path}")
+
     suffix = file_path.suffix.lower()
 
     if suffix == ".pdf":
         return load_pdf(file_path)
-
     if suffix == ".docx":
         return load_docx(file_path)
-
     if suffix == ".txt":
         return load_txt(file_path)
 
     raise ValueError(f"Formato não suportado: {suffix}")
-
-
-if __name__ == "__main__":
-    resources = "/home/della/Vault/florence/resources/"
-    tcc = Path(resources + "tcc.pdf")
-    workplan = Path(resources + "workplan.pdf")
-
-    print(load_pdf(tcc))
-    print(load_pdf(workplan))
