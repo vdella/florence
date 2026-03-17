@@ -1,0 +1,1 @@
+A administração segura de medicamentos depende de identificação correta do paciente, dose, via e horário.
