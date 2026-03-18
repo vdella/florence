@@ -1,21 +1,20 @@
-import hashlib
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 
-from app.core.config import settings
 from app.generation.qa import answer_from_contexts, get_qa_components
-from app.ingestion.chunker import chunk_text
-from app.ingestion.cleaner import clean_text
-from app.ingestion.embedder import embed_texts, get_embedding_model
+from app.generation.rewriter import get_rewriter_components, rewrite_answer
+from app.ingestion.embedder import get_embedding_model
 from app.ingestion.loaders import load_document
-from app.retrieval.retriever import retrieve, retrieve_from_embeddings
-from app.retrieval.store import CachedDocument, DOCUMENT_CACHE
+from app.retrieval.retriever import query_collection
+from app.schemas.answers import AnswerResponse, CitationItem
 from app.schemas.retrieval import SearchResponse
+from app.services.ingestion_service import ingest_document_text
+from app.storage.chroma_store import get_collection
 
 logger = logging.getLogger(__name__)
 
@@ -23,133 +22,50 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     try:
-        emb_model = get_embedding_model()
-        emb_model.encode(["warmup"], show_progress_bar=False)
-        logger.info("Embedding model loaded successfully.")
+        get_embedding_model()
+        logger.info("Embedding model loaded.")
     except Exception as exc:
         logger.exception("Embedding model preload failed: %r", exc)
 
     try:
         get_qa_components()
-        answer_from_contexts(
-            question="What is sepsis?",
-            contexts=["Sepsis is a serious condition caused by infection."],
-        )
-        logger.info("QA model loaded successfully.")
+        logger.info("QA model loaded.")
     except Exception as exc:
         logger.exception("QA model preload failed: %r", exc)
+
+    try:
+        get_rewriter_components()
+        logger.info("Rewriter model loaded.")
+    except Exception as exc:
+        logger.exception("Rewriter model preload failed: %r", exc)
+
+    try:
+        get_collection()
+        logger.info("Chroma collection ready.")
+    except Exception as exc:
+        logger.exception("Chroma startup failed: %r", exc)
 
     yield
 
 
 app = FastAPI(
     title="Florence API",
-    version="0.4.0",
-    description="Document reading MVP with Hugging Face retrieval + extractive QA + file cache",
+    version="0.5.0",
+    description="Persistent RAG with Chroma, extractive QA and answer rewriting",
     lifespan=lifespan,
 )
 
 
-class AnswerContextItem(BaseModel):
-    chunk_id: int | None = None
-    score: float | None = None
-    document: str
-
-
-class AnswerResponse(BaseModel):
-    query: str
-    answer: str
-    answer_score: float
-    context: list[AnswerContextItem]
-
-
-def _hash_bytes(content: bytes) -> str:
-    return hashlib.sha256(content).hexdigest()
-
-
-def _load_and_prepare_document_from_temp_path(temp_path: str) -> tuple[str, list[str]]:
-    raw_text = load_document(temp_path)
-    cleaned_text = clean_text(raw_text)
-
-    if not cleaned_text:
-        raise HTTPException(status_code=400, detail="document is empty after extraction/cleaning")
-
-    chunks = chunk_text(
-        cleaned_text,
-        chunk_size=settings.chunk_size,
-        overlap=settings.chunk_overlap,
-    )
-
-    if not chunks:
-        raise HTTPException(status_code=400, detail="document produced no usable chunks")
-
-    return cleaned_text, chunks
-
-
-def _get_or_create_cached_document(file_bytes: bytes, suffix: str) -> CachedDocument:
-    file_hash = _hash_bytes(file_bytes)
-
-    if file_hash in DOCUMENT_CACHE:
-        return DOCUMENT_CACHE[file_hash]
-
-    temp_path: str | None = None
-    try:
-        with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(file_bytes)
-            temp_path = tmp.name
-
-        _, chunks = _load_and_prepare_document_from_temp_path(temp_path)
-        embeddings = embed_texts(chunks)
-
-        cached = CachedDocument(
-            chunks=chunks,
-            embeddings=embeddings,
-        )
-        DOCUMENT_CACHE[file_hash] = cached
-        return cached
-    finally:
-        if temp_path:
-            Path(temp_path).unlink(missing_ok=True)
-
-
-def _build_answer_response_from_chunks_and_embeddings(
-        query: str,
-        chunks: list[str],
-        embeddings,
-        top_k: int,
-) -> AnswerResponse:
-    retrieval = retrieve_from_embeddings(
-        query=query,
-        chunks=chunks,
-        chunk_embeddings=embeddings,
-        top_k=top_k,
-    )
-
-    if not retrieval.results:
-        return AnswerResponse(
-            query=query,
-            answer="Não encontrei informações relevantes no documento.",
-            answer_score=0.0,
-            context=[],
-        )
-
-    qa_contexts = [item.document for item in retrieval.results[: settings.qa_top_k_contexts]]
-    qa_result = answer_from_contexts(question=query, contexts=qa_contexts)
-
-    return AnswerResponse(
-        query=query,
-        answer=qa_result["answer"],
-        answer_score=float(qa_result["score"]),
-        context=[
-            AnswerContextItem(
-                chunk_id=item.metadata.get("chunk_id"),
-                score=item.metadata.get("score"),
-                document=item.document,
-            )
-            for item in retrieval.results
-        ],
-    )
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 def root() -> dict[str, str]:
@@ -161,119 +77,112 @@ def root() -> dict[str, str]:
 
 
 @app.get("/health")
-def health() -> dict[str, str | int]:
+def health() -> dict[str, int | str]:
+    collection = get_collection()
+    count = collection.count()
     return {
         "status": "ok",
-        "cached_documents": len(DOCUMENT_CACHE),
+        "indexed_chunks": count,
     }
 
 
-@app.post("/query-text", response_model=SearchResponse)
-def query_text(
+@app.post("/ingest-file")
+async def ingest_file(file: UploadFile = File(...)) -> dict:
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in {".txt", ".pdf", ".docx"}:
+        raise HTTPException(status_code=400, detail="supported file types: .txt, .pdf, .docx")
+
+    temp_path = None
+
+    try:
+        content = await file.read()
+
+        with NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(content)
+            temp_path = tmp.name
+
+        text, page_map = load_document(temp_path)
+        source = file.filename or "uploaded_document"
+
+        return ingest_document_text(
+            text=text,
+            source=source,
+            page_map=page_map,
+        )
+
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=repr(exc)) from exc
+    finally:
+        if temp_path:
+            Path(temp_path).unlink(missing_ok=True)
+
+
+@app.post("/ingest-text")
+def ingest_text(
         text: str = Form(...),
+        source: str = Form(...),
+) -> dict:
+    try:
+        return ingest_document_text(text=text, source=source, page_map=[{"page": 1, "text": text}])
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=repr(exc)) from exc
+
+
+@app.post("/query", response_model=SearchResponse)
+def query(
         query: str = Form(...),
         top_k: int = Form(5),
 ) -> SearchResponse:
     if len(query.strip()) < 3:
         raise HTTPException(status_code=400, detail="query must have at least 3 characters")
 
-    cleaned_text = clean_text(text)
-    if not cleaned_text:
-        raise HTTPException(status_code=400, detail="provided text is empty after cleaning")
+    return query_collection(query=query, top_k=top_k)
 
-    chunks = chunk_text(
-        cleaned_text,
-        chunk_size=settings.chunk_size,
-        overlap=settings.chunk_overlap,
+
+@app.post("/ask", response_model=AnswerResponse)
+def ask(
+        query: str = Form(...),
+        top_k: int = Form(5),
+) -> AnswerResponse:
+    if len(query.strip()) < 3:
+        raise HTTPException(status_code=400, detail="query must have at least 3 characters")
+
+    retrieval = query_collection(query=query, top_k=top_k)
+
+    if not retrieval.results:
+        return AnswerResponse(
+            query=query,
+            answer="Não encontrei informações relevantes na base.",
+            extracted_answer="",
+            answer_score=0.0,
+            citations=[],
+        )
+
+    qa_contexts = [item.document for item in retrieval.results[:2]]
+    qa_result = answer_from_contexts(question=query, contexts=qa_contexts)
+
+    best_context = retrieval.results[0].document
+    rewritten = rewrite_answer(
+        question=query,
+        extracted_answer=qa_result["answer"],
+        context=best_context,
     )
 
-    return retrieve(query=query, chunks=chunks, top_k=top_k)
-
-
-@app.post("/ask-text", response_model=AnswerResponse)
-def ask_text(
-        text: str = Form(...),
-        query: str = Form(...),
-        top_k: int = Form(5),
-) -> AnswerResponse:
-    if len(query.strip()) < 3:
-        raise HTTPException(status_code=400, detail="query must have at least 3 characters")
-
-    cleaned_text = clean_text(text)
-    if not cleaned_text:
-        raise HTTPException(status_code=400, detail="provided text is empty after cleaning")
-
-    try:
-        chunks = chunk_text(
-            cleaned_text,
-            chunk_size=settings.chunk_size,
-            overlap=settings.chunk_overlap,
+    citations = [
+        CitationItem(
+            source=item.metadata.get("source"),
+            chunk_id=item.metadata.get("chunk_id"),
+            page=item.metadata.get("page"),
+            score=(1.0 - item.distance) if item.distance is not None else None,
+            excerpt=item.document[:300],
         )
-        embeddings = embed_texts(chunks)
+        for item in retrieval.results
+    ]
 
-        return _build_answer_response_from_chunks_and_embeddings(
-            query=query,
-            chunks=chunks,
-            embeddings=embeddings,
-            top_k=top_k,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=repr(exc)) from exc
-
-
-@app.post("/query-file", response_model=SearchResponse)
-async def query_file(
-        file: UploadFile = File(...),
-        query: str = Form(...),
-        top_k: int = Form(5),
-) -> SearchResponse:
-    if len(query.strip()) < 3:
-        raise HTTPException(status_code=400, detail="query must have at least 3 characters")
-
-    suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in {".txt", ".pdf", ".docx"}:
-        raise HTTPException(status_code=400, detail="supported file types: .txt, .pdf, .docx")
-
-    try:
-        file_bytes = await file.read()
-        cached = _get_or_create_cached_document(file_bytes=file_bytes, suffix=suffix)
-
-        return retrieve_from_embeddings(
-            query=query,
-            chunks=cached.chunks,
-            chunk_embeddings=cached.embeddings,
-            top_k=top_k,
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=repr(exc)) from exc
-
-
-@app.post("/ask-file", response_model=AnswerResponse)
-async def ask_file(
-        file: UploadFile = File(...),
-        query: str = Form(...),
-        top_k: int = Form(5),
-) -> AnswerResponse:
-    if len(query.strip()) < 3:
-        raise HTTPException(status_code=400, detail="query must have at least 3 characters")
-
-    suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in {".txt", ".pdf", ".docx"}:
-        raise HTTPException(status_code=400, detail="supported file types: .txt, .pdf, .docx")
-
-    try:
-        file_bytes = await file.read()
-        cached = _get_or_create_cached_document(file_bytes=file_bytes, suffix=suffix)
-
-        return _build_answer_response_from_chunks_and_embeddings(
-            query=query,
-            chunks=cached.chunks,
-            embeddings=cached.embeddings,
-            top_k=top_k,
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=repr(exc)) from exc
+    return AnswerResponse(
+        query=query,
+        answer=rewritten,
+        extracted_answer=qa_result["answer"],
+        answer_score=float(qa_result["score"]),
+        citations=citations,
+    )

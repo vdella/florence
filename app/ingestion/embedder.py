@@ -14,22 +14,21 @@ def get_embedding_model() -> SentenceTransformer:
     return _model
 
 
-def embed_texts(texts: list[str]):
-    model = get_embedding_model()
-    return model.encode(
-        texts,
-        convert_to_tensor=True,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
-
-
-def embed_query(query: str):
+def embed_texts(texts: list[str]) -> list[list[float]]:
     model = get_embedding_model()
     embeddings = model.encode(
-        [query],
-        convert_to_tensor=True,
+        texts,
         normalize_embeddings=True,
         show_progress_bar=False,
     )
-    return embeddings[0]
+    return embeddings.tolist()
+
+
+def embed_query(query: str) -> list[float]:
+    model = get_embedding_model()
+    embedding = model.encode(
+        [query],
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )[0]
+    return embedding.tolist()

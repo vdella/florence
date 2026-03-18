@@ -14,15 +14,9 @@ def get_qa_components():
         model_name = settings.huggingface_qa_model
 
         try:
-            _tokenizer = AutoTokenizer.from_pretrained(
-                model_name,
-                use_fast=True,
-            )
+            _tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         except Exception:
-            _tokenizer = AutoTokenizer.from_pretrained(
-                model_name,
-                use_fast=False,
-            )
+            _tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
 
         _model = AutoModelForQuestionAnswering.from_pretrained(model_name)
         _model.eval()
@@ -30,7 +24,7 @@ def get_qa_components():
     return _tokenizer, _model
 
 
-def _extract_answer(question: str, context: str) -> dict:
+def extract_answer(question: str, context: str) -> dict:
     tokenizer, model = get_qa_components()
 
     inputs = tokenizer(
@@ -68,22 +62,18 @@ def _extract_answer(question: str, context: str) -> dict:
     }
 
 
-def answer_from_contexts(
-        question: str,
-        contexts: list[str],
-        min_score: float | None = None,
-) -> dict:
+def answer_from_contexts(question: str, contexts: list[str], min_score: float | None = None) -> dict:
     if min_score is None:
         min_score = settings.qa_min_score
 
-    best_result: dict | None = None
-    best_context_index: int | None = None
+    best_result = None
+    best_context_index = None
 
     for idx, context in enumerate(contexts):
-        if not context or not context.strip():
+        if not context.strip():
             continue
 
-        result = _extract_answer(question=question, context=context)
+        result = extract_answer(question=question, context=context)
         score = float(result.get("score", 0.0))
 
         if best_result is None or score > float(best_result.get("score", 0.0)):
@@ -98,15 +88,11 @@ def answer_from_contexts(
         return {
             "answer": "Não encontrei uma resposta confiável no documento.",
             "score": 0.0,
-            "start": None,
-            "end": None,
             "context_index": None,
         }
 
     return {
-        "answer": str(best_result.get("answer", "")).strip(),
-        "score": float(best_result.get("score", 0.0)),
-        "start": best_result.get("start"),
-        "end": best_result.get("end"),
+        "answer": str(best_result["answer"]).strip(),
+        "score": float(best_result["score"]),
         "context_index": best_context_index,
     }

@@ -1,50 +1,30 @@
-from sentence_transformers import util
-
-from app.ingestion.embedder import embed_query, embed_texts
+from app.ingestion.embedder import embed_query
 from app.schemas.retrieval import SearchResponse, SearchResultItem
+from app.storage.chroma_store import get_collection
 
 
-def retrieve(query: str, chunks: list[str], top_k: int = 5) -> SearchResponse:
-    if not chunks:
-        return SearchResponse(query=query, results=[])
+def query_collection(query: str, top_k: int = 5) -> SearchResponse:
+    collection = get_collection()
+    query_embedding = embed_query(query)
 
-    chunk_embeddings = embed_texts(chunks)
-    return retrieve_from_embeddings(
-        query=query,
-        chunks=chunks,
-        chunk_embeddings=chunk_embeddings,
-        top_k=top_k,
+    result = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k,
+        include=["documents", "metadatas", "distances"],
     )
 
+    documents = result.get("documents", [[]])[0]
+    metadatas = result.get("metadatas", [[]])[0]
+    distances = result.get("distances", [[]])[0]
 
-def retrieve_from_embeddings(
-        query: str,
-        chunks: list[str],
-        chunk_embeddings,
-        top_k: int = 5,
-) -> SearchResponse:
-    if not chunks:
-        return SearchResponse(query=query, results=[])
-
-    query_embedding = embed_query(query)
-    scores = util.cos_sim(query_embedding, chunk_embeddings)[0]
-
-    k = min(top_k, len(chunks))
-    top_indices = scores.argsort(descending=True)[:k].tolist()
-
-    results: list[SearchResultItem] = []
-    for idx in top_indices:
-        score = float(scores[idx])
-
-        results.append(
+    items = []
+    for document, metadata, distance in zip(documents, metadatas, distances):
+        items.append(
             SearchResultItem(
-                document=chunks[idx],
-                metadata={
-                    "chunk_id": idx,
-                    "score": score,
-                },
-                distance=1.0 - score,
+                document=document,
+                metadata=metadata or {},
+                distance=float(distance) if distance is not None else None,
             )
         )
 
-    return SearchResponse(query=query, results=results)
+    return SearchResponse(query=query, results=items)
