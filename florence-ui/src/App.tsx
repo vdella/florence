@@ -46,19 +46,61 @@ type IngestResponse = {
 
 type ApiResult = QueryResponse | AskResponse | IngestResponse | Record<string, unknown> | null;
 
+function stringifyUnknown(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (value == null) return "";
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function extractErrorMessage(data: unknown, fallback: string): string {
+  if (!data) return fallback;
+
+  if (typeof data === "string") return data;
+
+  if (Array.isArray(data)) {
+    return data.map((item) => extractErrorMessage(item, "")).filter(Boolean).join("\n");
+  }
+
+  if (typeof data === "object") {
+    const obj = data as Record<string, unknown>;
+
+    if ("detail" in obj) {
+      return extractErrorMessage(obj.detail, fallback);
+    }
+
+    if ("message" in obj && typeof obj.message === "string") {
+      return obj.message;
+    }
+
+    return stringifyUnknown(obj);
+  }
+
+  return fallback;
+}
+
+async function parseJsonResponse(res: Response) {
+  const contentType = res.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    return res.json();
+  }
+  return { detail: await res.text() };
+}
+
 export default function App() {
   const defaultApiBase = "http://127.0.0.1:8000";
 
   const [tab, setTab] = useState<"ingest" | "query" | "ask">("ask");
   const [apiBase, setApiBase] = useState(defaultApiBase);
-
   const [query, setQuery] = useState("");
   const [topK, setTopK] = useState(3);
-
   const [sourceName, setSourceName] = useState("manual_note.txt");
   const [text, setText] = useState("");
   const [ingestFile, setIngestFile] = useState<File | null>(null);
-
   const [loading, setLoading] = useState(false);
   const [healthLoading, setHealthLoading] = useState(false);
   const [health, setHealth] = useState<HealthResponse | null>(null);
@@ -74,32 +116,39 @@ export default function App() {
 
   const normalizedApiBase = apiBase.replace(/\/+$/, "");
 
-  const askResult = result as AskResponse | null;
-  const queryResult = result as QueryResponse | null;
-  const ingestResult = result as IngestResponse | null;
+  const askResult =
+      result && typeof result === "object" && "answer" in result
+          ? (result as AskResponse)
+          : null;
 
-  async function parseJsonResponse(res: Response) {
-    const contentType = res.headers.get("content-type") || "";
-    if (contentType.includes("application/json")) {
-      return res.json();
-    }
-    return { detail: await res.text() };
-  }
+  const queryResult =
+      result && typeof result === "object" && "results" in result
+          ? (result as QueryResponse)
+          : null;
+
+  const ingestResult =
+      result &&
+      typeof result === "object" &&
+      !("answer" in result) &&
+      !("results" in result)
+          ? (result as IngestResponse)
+          : null;
 
   async function callHealth() {
     setHealthLoading(true);
     setError("");
+
     try {
       const res = await fetch(`${normalizedApiBase}/health`);
-      const data = (await parseJsonResponse(res)) as HealthResponse | { detail?: string };
+      const data = await parseJsonResponse(res);
 
       if (!res.ok) {
-        throw new Error((data as { detail?: string }).detail || `HTTP ${res.status}`);
+        throw new Error(extractErrorMessage(data, `HTTP ${res.status}`));
       }
 
       setHealth(data as HealthResponse);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(err instanceof Error ? err.message : stringifyUnknown(err));
     } finally {
       setHealthLoading(false);
     }
@@ -122,13 +171,14 @@ export default function App() {
       });
 
       const data = await parseJsonResponse(res);
+
       if (!res.ok) {
-        throw new Error((data as { detail?: string }).detail || `HTTP ${res.status}`);
+        throw new Error(extractErrorMessage(data, `HTTP ${res.status}`));
       }
 
       setResult(data as IngestResponse);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(err instanceof Error ? err.message : stringifyUnknown(err));
     } finally {
       setLoading(false);
     }
@@ -152,13 +202,14 @@ export default function App() {
       });
 
       const data = await parseJsonResponse(res);
+
       if (!res.ok) {
-        throw new Error((data as { detail?: string }).detail || `HTTP ${res.status}`);
+        throw new Error(extractErrorMessage(data, `HTTP ${res.status}`));
       }
 
       setResult(data as IngestResponse);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(err instanceof Error ? err.message : stringifyUnknown(err));
     } finally {
       setLoading(false);
     }
@@ -181,13 +232,14 @@ export default function App() {
       });
 
       const data = await parseJsonResponse(res);
+
       if (!res.ok) {
-        throw new Error((data as { detail?: string }).detail || `HTTP ${res.status}`);
+        throw new Error(extractErrorMessage(data, `HTTP ${res.status}`));
       }
 
       setResult(data as QueryResponse);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(err instanceof Error ? err.message : stringifyUnknown(err));
     } finally {
       setLoading(false);
     }
@@ -210,13 +262,14 @@ export default function App() {
       });
 
       const data = await parseJsonResponse(res);
+
       if (!res.ok) {
-        throw new Error((data as { detail?: string }).detail || `HTTP ${res.status}`);
+        throw new Error(extractErrorMessage(data, `HTTP ${res.status}`));
       }
 
       setResult(data as AskResponse);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(err instanceof Error ? err.message : stringifyUnknown(err));
     } finally {
       setLoading(false);
     }
@@ -228,28 +281,27 @@ export default function App() {
   }
 
   return (
-      <div className="min-h-screen bg-slate-50 text-slate-900 p-6">
-        <div className="max-w-7xl mx-auto grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
+      <div className="min-h-screen bg-slate-50 text-slate-900">
+        <div className="mx-auto max-w-7xl p-6 grid lg:grid-cols-2 gap-6">
           <div className="space-y-6">
-            <div className="rounded-3xl bg-white shadow-sm border border-slate-200 p-6">
-              <div className="flex items-start justify-between gap-4 flex-wrap">
-                <div>
-                  <h1 className="text-3xl font-semibold tracking-tight">Florence</h1>
-                  <p className="text-slate-600 mt-2">
-                    Interface para ingestão, consulta e resposta sobre a base RAG de documentos de saúde.
-                  </p>
-                </div>
-                <button
-                    onClick={callHealth}
-                    className="rounded-2xl px-4 py-2 bg-slate-900 text-white hover:opacity-90 transition"
-                >
-                  {healthLoading ? "Verificando..." : "Checar API"}
-                </button>
+            <div className="rounded-3xl bg-white shadow-sm border border-slate-200 p-6 space-y-5">
+              <div>
+                <h1 className="text-3xl font-bold">Florence UI</h1>
+                <p className="text-slate-600 mt-2">
+                  Interface para ingestão, consulta e resposta sobre a base RAG de documentos de saúde.
+                </p>
               </div>
 
-              <div className="mt-5 grid md:grid-cols-[1fr_auto] gap-3 items-end">
+              <button
+                  onClick={callHealth}
+                  className="rounded-2xl px-4 py-3 bg-slate-900 text-white hover:opacity-90"
+              >
+                {healthLoading ? "Verificando..." : "Checar API"}
+              </button>
+
+              <div className="grid md:grid-cols-[1fr_auto] gap-4 items-end">
                 <label className="block">
-                  <span className="text-sm font-medium text-slate-700">Base URL da API</span>
+                  <span className="text-sm text-slate-700">Base URL da API</span>
                   <input
                       value={apiBase}
                       onChange={(e) => setApiBase(e.target.value)}
@@ -257,52 +309,44 @@ export default function App() {
                       placeholder="http://127.0.0.1:8000"
                   />
                 </label>
-                <div className="text-sm text-slate-500">
-                  Endpoint atual: <span className="font-mono">{endpointHint}</span>
-                </div>
+                <div className="text-slate-500">Endpoint atual: {endpointHint}</div>
               </div>
 
               {health && (
-                  <div className="mt-4 rounded-2xl bg-emerald-50 border border-emerald-200 p-4 text-sm">
-                    <div>
-                      <span className="font-medium">Status:</span> {health.status}
-                    </div>
+                  <div className="rounded-2xl bg-emerald-50 border border-emerald-200 p-4">
+                    <div>Status: {health.status}</div>
                     {health.indexed_chunks !== undefined && (
-                        <div>
-                          <span className="font-medium">Chunks indexados:</span> {health.indexed_chunks}
-                        </div>
+                        <div>Chunks indexados: {health.indexed_chunks}</div>
                     )}
                     {health.cached_documents !== undefined && (
-                        <div>
-                          <span className="font-medium">Documentos em cache:</span> {health.cached_documents}
-                        </div>
+                        <div>Documentos em cache: {health.cached_documents}</div>
                     )}
                   </div>
               )}
             </div>
 
-            <div className="rounded-3xl bg-white shadow-sm border border-slate-200 p-3">
-              <div className="grid grid-cols-3 gap-2">
-                {[
-                  ["ingest", "Ingestão"],
-                  ["query", "Busca"],
-                  ["ask", "Resposta"],
-                ].map(([key, label]) => (
-                    <button
-                        key={key}
-                        onClick={() => setTab(key as "ingest" | "query" | "ask")}
-                        className={`rounded-2xl px-4 py-3 text-sm font-medium transition ${
-                            tab === key ? "bg-slate-900 text-white" : "bg-slate-100 text-slate-700 hover:bg-slate-200"
-                        }`}
-                    >
-                      {label}
-                    </button>
-                ))}
-              </div>
+            <div className="rounded-3xl bg-white shadow-sm border border-slate-200 p-4 flex gap-3">
+              {[
+                ["ingest", "Ingestão"],
+                ["query", "Busca"],
+                ["ask", "Resposta"],
+              ].map(([key, label]) => (
+                  <button
+                      key={key}
+                      onClick={() => setTab(key as "ingest" | "query" | "ask")}
+                      className={`flex-1 rounded-2xl px-4 py-3 text-sm font-medium transition ${
+                          tab === key
+                              ? "bg-slate-900 text-white"
+                              : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                      }`}
+                  >
+                    {label}
+                  </button>
+              ))}
             </div>
 
             {tab === "ingest" && (
-                <div className="rounded-3xl bg-white shadow-sm border border-slate-200 p-6 space-y-6">
+                <div className="rounded-3xl bg-white shadow-sm border border-slate-200 p-6 space-y-5">
                   <div>
                     <h2 className="text-xl font-semibold">Ingestão</h2>
                     <p className="text-slate-600 mt-1">
@@ -310,9 +354,10 @@ export default function App() {
                     </p>
                   </div>
 
-                  <div className="grid md:grid-cols-2 gap-6">
+                  <div className="grid md:grid-cols-2 gap-4">
                     <div className="rounded-2xl border border-slate-200 p-4 space-y-4">
                       <div className="font-medium">Ingerir texto</div>
+
                       <label className="block">
                         <span className="text-sm text-slate-700">Nome da fonte</span>
                         <input
@@ -322,6 +367,7 @@ export default function App() {
                             placeholder="protocolo_sepse.txt"
                         />
                       </label>
+
                       <label className="block">
                         <span className="text-sm text-slate-700">Texto</span>
                         <textarea
@@ -332,6 +378,7 @@ export default function App() {
                             placeholder="Cole aqui o texto do documento..."
                         />
                       </label>
+
                       <button
                           onClick={handleIngestText}
                           className="rounded-2xl px-4 py-3 bg-slate-900 text-white hover:opacity-90"
@@ -343,6 +390,7 @@ export default function App() {
 
                     <div className="rounded-2xl border border-slate-200 p-4 space-y-4">
                       <div className="font-medium">Ingerir arquivo</div>
+
                       <label className="block">
                         <span className="text-sm text-slate-700">Arquivo (.txt, .pdf, .docx)</span>
                         <input
@@ -351,6 +399,7 @@ export default function App() {
                             className="mt-1 w-full rounded-2xl border border-slate-300 px-4 py-3 bg-white"
                         />
                       </label>
+
                       <div className="rounded-2xl bg-slate-50 p-4 text-sm text-slate-600 min-h-24">
                         {ingestFile ? (
                             <div>
@@ -358,16 +407,19 @@ export default function App() {
                                 <span className="font-medium">Nome:</span> {ingestFile.name}
                               </div>
                               <div>
-                                <span className="font-medium">Tamanho:</span> {Math.round(ingestFile.size / 1024)} KB
+                                <span className="font-medium">Tamanho:</span>{" "}
+                                {Math.round(ingestFile.size / 1024)} KB
                               </div>
                               <div>
-                                <span className="font-medium">Tipo:</span> {ingestFile.type || "desconhecido"}
+                                <span className="font-medium">Tipo:</span>{" "}
+                                {ingestFile.type || "desconhecido"}
                               </div>
                             </div>
                         ) : (
                             "Nenhum arquivo selecionado."
                         )}
                       </div>
+
                       <button
                           onClick={handleIngestFile}
                           className="rounded-2xl px-4 py-3 bg-slate-900 text-white hover:opacity-90"
@@ -383,7 +435,9 @@ export default function App() {
             {tab !== "ingest" && (
                 <div className="rounded-3xl bg-white shadow-sm border border-slate-200 p-6 space-y-5">
                   <div>
-                    <h2 className="text-xl font-semibold">{tab === "query" ? "Busca semântica" : "Perguntar à base"}</h2>
+                    <h2 className="text-xl font-semibold">
+                      {tab === "query" ? "Busca semântica" : "Perguntar à base"}
+                    </h2>
                     <p className="text-slate-600 mt-1">
                       {tab === "query"
                           ? "Consulta a base persistida e retorna os chunks mais relevantes."
@@ -401,6 +455,7 @@ export default function App() {
                           placeholder="Quais são os sinais de sepse?"
                       />
                     </label>
+
                     <label className="block">
                       <span className="text-sm text-slate-700">Top K</span>
                       <input
@@ -430,14 +485,19 @@ export default function App() {
               <div className="flex items-center justify-between gap-4 mb-4">
                 <h2 className="text-xl font-semibold">Resultado</h2>
                 {result && (
-                    <button onClick={copyJson} className="rounded-2xl px-3 py-2 bg-slate-100 hover:bg-slate-200 text-sm">
+                    <button
+                        onClick={copyJson}
+                        className="rounded-2xl px-3 py-2 bg-slate-100 hover:bg-slate-200 text-sm"
+                    >
                       Copiar JSON
                     </button>
                 )}
               </div>
 
               {error && (
-                  <div className="rounded-2xl bg-red-50 border border-red-200 p-4 text-red-700 text-sm mb-4">{error}</div>
+                  <pre className="rounded-2xl bg-red-50 border border-red-200 p-4 text-red-700 text-sm mb-4 whitespace-pre-wrap overflow-auto">
+                {error}
+              </pre>
               )}
 
               {!result && !error && (
@@ -446,17 +506,25 @@ export default function App() {
                   </div>
               )}
 
-              {askResult && "answer" in askResult && (
+              {askResult && (
                   <div className="space-y-5">
                     <div className="rounded-2xl bg-slate-50 p-4">
-                      <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">Resposta final</div>
-                      <div className="text-lg leading-7">{askResult.answer}</div>
+                      <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">
+                        Resposta final
+                      </div>
+                      <div className="text-lg leading-7 whitespace-pre-wrap">
+                        {stringifyUnknown(askResult.answer)}
+                      </div>
                     </div>
 
                     {askResult.extracted_answer && (
                         <div className="rounded-2xl border border-slate-200 p-4">
-                          <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">Resposta extraída</div>
-                          <div>{askResult.extracted_answer}</div>
+                          <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">
+                            Resposta extraída
+                          </div>
+                          <div className="whitespace-pre-wrap">
+                            {stringifyUnknown(askResult.extracted_answer)}
+                          </div>
                           <div className="mt-3 text-sm text-slate-500">
                             Score: {Number(askResult.answer_score).toFixed(4)}
                           </div>
@@ -478,7 +546,9 @@ export default function App() {
                                       ? ` · Score ${Number(citation.score).toFixed(4)}`
                                       : ""}
                                 </div>
-                                <div className="text-sm leading-6 text-slate-800">{citation.excerpt}</div>
+                                <div className="text-sm leading-6 text-slate-800 whitespace-pre-wrap">
+                                  {citation.excerpt}
+                                </div>
                               </div>
                           ))}
                         </div>
@@ -486,7 +556,7 @@ export default function App() {
                   </div>
               )}
 
-              {queryResult && "results" in queryResult && (
+              {queryResult && (
                   <div className="space-y-4">
                     <div className="text-sm font-medium text-slate-700">Chunks recuperados</div>
                     {queryResult.results.map((item, idx) => (
@@ -507,30 +577,11 @@ export default function App() {
                   </div>
               )}
 
-              {ingestResult && !("answer" in ingestResult) && !("results" in ingestResult) && result && (
-                  <pre className="rounded-2xl bg-slate-950 text-slate-100 p-4 overflow-auto text-xs">
-                {JSON.stringify(result, null, 2)}
+              {ingestResult && (
+                  <pre className="rounded-2xl bg-slate-950 text-slate-100 p-4 overflow-auto text-xs whitespace-pre-wrap">
+                {JSON.stringify(ingestResult, null, 2)}
               </pre>
               )}
-            </div>
-
-            <div className="rounded-3xl bg-white shadow-sm border border-slate-200 p-6">
-              <h3 className="text-lg font-semibold">Fluxo sugerido</h3>
-              <div className="mt-3 space-y-2 text-sm text-slate-600">
-                <div>
-                  1. Verifique a API em <span className="font-mono">/health</span>.
-                </div>
-                <div>
-                  2. Ingerir um documento via <span className="font-mono">/ingest-file</span> ou{" "}
-                  <span className="font-mono">/ingest-text</span>.
-                </div>
-                <div>
-                  3. Testar recuperação com <span className="font-mono">/query</span>.
-                </div>
-                <div>
-                  4. Gerar resposta final com <span className="font-mono">/ask</span>.
-                </div>
-              </div>
             </div>
           </div>
         </div>
